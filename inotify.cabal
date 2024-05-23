@@ -1,0 +1,13 @@
+cabal-version: 2.2
+
+name: inotify
+version: 0
+
+library
+  build-depends:
+    base,
+    filepath,
+    unix,
+  default-language: GHC2021
+  exposed-modules: Inotify
+  ghc-options: -Wall
