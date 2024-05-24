@@ -1,9 +1,45 @@
 {-# LANGUAGE CApiFFI #-}
 
-module Inotify where
+module Inotify
+  ( Inotify,
+    with,
+    watch,
+    Event (..),
+    EventType (..),
+    await,
+
+    -- * Event types
+    access,
+    attrib,
+    closeNowrite,
+    closeWrite,
+    create,
+    delete,
+    deleteSelf,
+    modify,
+    moveSelf,
+    movedFrom,
+    movedTo,
+    open,
+
+    -- ** Derived event types
+    allEvents,
+    close,
+    move,
+
+    -- * Watch options
+    dontFollow,
+    exclUnlink,
+    maskAdd,
+    maskCreate,
+    oneshot,
+    onlydir,
+  )
+where
 
 import Control.Concurrent (threadWaitRead)
 import Control.Monad (forever)
+import Data.Bits ((.&.))
 import Data.ByteString.Short (ShortByteString)
 import Data.ByteString.Short qualified as ByteString.Short
 import Data.ByteString.Short.Internal qualified as ByteString.Short (createFromPtr)
@@ -17,10 +53,6 @@ import System.OsString.Internal.Types (OsString (..), PosixString (..))
 import System.Posix.Types (CSsize (..), Fd (..))
 import Prelude hiding (read)
 
-type InitFlags = CInt
-
-type Events = Word32
-
 type WatchDescriptor = CInt
 
 data Inotify
@@ -31,24 +63,17 @@ data Inotify
     buflenRef :: {-# UNPACK #-} !(IORef Int)
   }
 
-main :: IO ()
+main :: IO (Either CInt ())
 main = do
-  result <-
-    with \inotify -> do
-      putStrLn "make an inotify!"
-
-      putStrLn "adding a watch!"
-
-      watch inotify (unsafeEncodeUtf ".") _IN_ALL_EVENTS >>= print
-
-      putStrLn "awaiting events!"
-      forever @IO @() @() do
-        await inotify >>= print
-  print result
+  with \inotify -> do
+    watch inotify (unsafeEncodeUtf ".") allEvents >>= print
+    putStrLn "awaiting events!"
+    forever @IO @() @() do
+      await inotify >>= print
 
 with :: (Inotify -> IO a) -> IO (Either CInt a)
 with action =
-  inotify_init1 _IN_NONBLOCK >>= \case
+  inotify_init1 nonblock >>= \case
     -1 -> do
       Errno errno <- getErrno
       pure (Left errno)
@@ -58,7 +83,7 @@ with action =
       allocaBytesAligned 4096 (sizeOf (0 :: Int)) \buffer ->
         Right <$> action Inotify {fd, buffer, offsetRef, buflenRef}
 
-watch :: Inotify -> OsString -> Events -> IO (Either CInt WatchDescriptor)
+watch :: Inotify -> OsString -> Word32 -> IO (Either CInt WatchDescriptor)
 watch inotify (OsString (PosixString path)) mask =
   ByteString.Short.useAsCString path \cpath ->
     inotify_add_watch inotify.fd (ConstPtr cpath) mask >>= \case
@@ -69,12 +94,29 @@ watch inotify (OsString (PosixString path)) mask =
 
 data Event
   = Event
-  { wd :: {-# UNPACK #-} !CInt,
-    mask :: {-# UNPACK #-} !Word32,
-    cookie :: {-# UNPACK #-} !Word32,
-    len :: {-# UNPACK #-} !Word32,
-    name :: !ShortByteString
+  { type_ :: !EventType,
+    wd :: {-# UNPACK #-} !CInt,
+    name :: !ShortByteString,
+    ignored :: !Bool,
+    isdir :: !Bool,
+    qOverflow :: !Bool,
+    unmount :: !Bool
   }
+  deriving stock (Show)
+
+data EventType
+  = Access
+  | Attrib
+  | CloseNowrite
+  | CloseWrite
+  | Create
+  | Delete
+  | DeleteSelf
+  | Modify
+  | MoveSelf
+  | MovedFrom !Word32
+  | MovedTo !Word32
+  | Open
   deriving stock (Show)
 
 await :: Inotify -> IO (Either CInt Event)
@@ -105,7 +147,34 @@ parseEvent inotify offset = do
         end <- rawmemchr (ConstPtr beginning) 0
         ByteString.Short.createFromPtr beginning (minusPtr end beginning)
   writeIORef inotify.offsetRef $! offset + sizeOfCInt + 12 + fromIntegral @Word32 @Int len
-  pure (Event {wd, mask, cookie, len, name})
+  pure
+    Event
+      { type_ =
+          if
+            | has mask access -> Access
+            | has mask attrib -> Attrib
+            | has mask closeNowrite -> CloseNowrite
+            | has mask closeWrite -> CloseWrite
+            | has mask create -> Create
+            | has mask delete -> Delete
+            | has mask deleteSelf -> DeleteSelf
+            | has mask modify -> Modify
+            | has mask moveSelf -> MoveSelf
+            | has mask movedFrom -> MovedFrom cookie
+            | has mask movedTo -> MovedTo cookie
+            | has mask open -> Open
+            | otherwise -> undefined,
+        wd,
+        name,
+        ignored = has mask _IN_IGNORED,
+        isdir = has mask _IN_ISDIR,
+        qOverflow = has mask _IN_Q_OVERFLOW,
+        unmount = has mask _IN_UNMOUNT
+      }
+
+has :: Word32 -> Word32 -> Bool
+has set bit =
+  set .&. bit /= 0
 
 sizeOfCInt :: Int
 sizeOfCInt =
@@ -135,6 +204,54 @@ foreign import capi unsafe "sys/inotify.h inotify_init1"
 foreign import capi unsafe "sys/inotify.h inotify_add_watch"
   inotify_add_watch :: Fd -> ConstPtr CChar -> Word32 -> IO CInt
 
-foreign import capi "sys/inotify.h value IN_ALL_EVENTS" _IN_ALL_EVENTS :: Word32
+foreign import capi "sys/inotify.h value IN_ACCESS" access :: Word32
 
-foreign import capi "sys/inotify.h value IN_NONBLOCK" _IN_NONBLOCK :: CInt
+foreign import capi "sys/inotify.h value IN_ALL_EVENTS" allEvents :: Word32
+
+foreign import capi "sys/inotify.h value IN_ATTRIB" attrib :: Word32
+
+foreign import capi "sys/inotify.h value IN_CLOSE" close :: Word32
+
+foreign import capi "sys/inotify.h value IN_CLOSE_NOWRITE" closeNowrite :: Word32
+
+foreign import capi "sys/inotify.h value IN_CLOSE_WRITE" closeWrite :: Word32
+
+foreign import capi "sys/inotify.h value IN_CREATE" create :: Word32
+
+foreign import capi "sys/inotify.h value IN_DELETE" delete :: Word32
+
+foreign import capi "sys/inotify.h value IN_DELETE_SELF" deleteSelf :: Word32
+
+foreign import capi "sys/inotify.h value IN_DONT_FOLLOW" dontFollow :: Word32
+
+foreign import capi "sys/inotify.h value IN_EXCL_UNLINK" exclUnlink :: Word32
+
+foreign import capi "sys/inotify.h value IN_IGNORED" _IN_IGNORED :: Word32
+
+foreign import capi "sys/inotify.h value IN_ISDIR" _IN_ISDIR :: Word32
+
+foreign import capi "sys/inotify.h value IN_MASK_ADD" maskAdd :: Word32
+
+foreign import capi "sys/inotify.h value IN_MASK_CREATE" maskCreate :: Word32
+
+foreign import capi "sys/inotify.h value IN_MODIFY" modify :: Word32
+
+foreign import capi "sys/inotify.h value IN_MOVE" move :: Word32
+
+foreign import capi "sys/inotify.h value IN_MOVED_FROM" movedFrom :: Word32
+
+foreign import capi "sys/inotify.h value IN_MOVED_TO" movedTo :: Word32
+
+foreign import capi "sys/inotify.h value IN_MOVE_SELF" moveSelf :: Word32
+
+foreign import capi "sys/inotify.h value IN_NONBLOCK" nonblock :: CInt
+
+foreign import capi "sys/inotify.h value IN_ONESHOT" oneshot :: Word32
+
+foreign import capi "sys/inotify.h value IN_ONLYDIR" onlydir :: Word32
+
+foreign import capi "sys/inotify.h value IN_OPEN" open :: Word32
+
+foreign import capi "sys/inotify.h value IN_Q_OVERFLOW" _IN_Q_OVERFLOW :: Word32
+
+foreign import capi "sys/inotify.h value IN_UNMOUNT" _IN_UNMOUNT :: Word32
