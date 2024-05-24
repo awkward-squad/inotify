@@ -4,10 +4,19 @@ name: inotify
 version: 0
 
 library
+  if os(windows) || os(darwin)
+    buildable: False
   build-depends:
-    base,
-    filepath,
+    base ^>= 4.18 || ^>= 4.19 || ^>= 4.20,
+    bytestring,
+    os-string,
     unix,
+  default-extensions:
+    BlockArguments
+    DerivingStrategies
+    LambdaCase
+    NoFieldSelectors
+    OverloadedRecordDot
   default-language: GHC2021
   exposed-modules: Inotify
   ghc-options: -Wall
