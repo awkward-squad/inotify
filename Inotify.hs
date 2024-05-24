@@ -2,19 +2,19 @@
 
 module Inotify where
 
-import Control.Concurrent
-import Control.Monad
+import Control.Concurrent (threadWaitRead)
+import Control.Monad (forever)
 import Data.ByteString.Short (ShortByteString)
 import Data.ByteString.Short qualified as ByteString.Short
 import Data.ByteString.Short.Internal qualified as ByteString.Short (createFromPtr)
-import Data.IORef
-import Data.Word
-import Foreign
-import Foreign.C
-import Foreign.C.ConstPtr
-import System.OsString
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Word (Word32)
+import Foreign (Ptr, Storable (peek, sizeOf), allocaBytesAligned, minusPtr, plusPtr)
+import Foreign.C (CChar, CInt (..), CSize (..), Errno (..), eAGAIN, getErrno)
+import Foreign.C.ConstPtr (ConstPtr (ConstPtr))
+import System.OsString (OsString, unsafeEncodeUtf)
 import System.OsString.Internal.Types (OsString (..), PosixString (..))
-import System.Posix.Types
+import System.Posix.Types (CSsize (..), Fd (..))
 import Prelude hiding (read)
 
 type InitFlags = CInt
@@ -34,20 +34,20 @@ data Inotify
 main :: IO ()
 main = do
   result <-
-    withInotify \inotify -> do
+    with \inotify -> do
       putStrLn "make an inotify!"
 
       putStrLn "adding a watch!"
 
-      inotifyAddWatch inotify.fd (unsafeEncodeUtf ".") _IN_ALL_EVENTS >>= print
+      watch inotify (unsafeEncodeUtf ".") _IN_ALL_EVENTS >>= print
 
       putStrLn "awaiting events!"
       forever @IO @() @() do
-        awaitInotifyEvent inotify >>= print
+        await inotify >>= print
   print result
 
-withInotify :: (Inotify -> IO a) -> IO (Either CInt a)
-withInotify action =
+with :: (Inotify -> IO a) -> IO (Either CInt a)
+with action =
   inotify_init1 _IN_NONBLOCK >>= \case
     -1 -> do
       Errno errno <- getErrno
@@ -58,26 +58,27 @@ withInotify action =
       allocaBytesAligned 4096 (sizeOf (0 :: Int)) \buffer ->
         Right <$> action Inotify {fd, buffer, offsetRef, buflenRef}
 
-inotifyAddWatch :: Fd -> OsString -> Events -> IO (Either CInt WatchDescriptor)
-inotifyAddWatch fd (OsString (PosixString path)) mask =
+watch :: Inotify -> OsString -> Events -> IO (Either CInt WatchDescriptor)
+watch inotify (OsString (PosixString path)) mask =
   ByteString.Short.useAsCString path \cpath ->
-    inotify_add_watch fd (ConstPtr cpath) mask >>= \case
+    inotify_add_watch inotify.fd (ConstPtr cpath) mask >>= \case
       -1 -> do
         Errno errno <- getErrno
         pure (Left errno)
       wd -> pure (Right wd)
 
-data InotifyEvent
-  = InotifyEvent
-  { wd :: CInt,
-    mask :: Word32,
-    cookie :: Word32,
-    len :: Word32
+data Event
+  = Event
+  { wd :: {-# UNPACK #-} !CInt,
+    mask :: {-# UNPACK #-} !Word32,
+    cookie :: {-# UNPACK #-} !Word32,
+    len :: {-# UNPACK #-} !Word32,
+    name :: !ShortByteString
   }
   deriving stock (Show)
 
-awaitInotifyEvent :: Inotify -> IO (Either CInt InotifyEvent)
-awaitInotifyEvent inotify = do
+await :: Inotify -> IO (Either CInt Event)
+await inotify = do
   offset <- readIORef inotify.offsetRef
   buflen <- readIORef inotify.buflenRef
   if offset >= buflen
@@ -90,34 +91,25 @@ awaitInotifyEvent inotify = do
           Right <$> parseEvent inotify 0
     else Right <$> parseEvent inotify offset
 
-parseEvent :: Inotify -> Int -> IO InotifyEvent
+parseEvent :: Inotify -> Int -> IO Event
 parseEvent inotify offset = do
   wd <- peek @CInt (plusPtr inotify.buffer offset)
   mask <- peek @Word32 (plusPtr inotify.buffer (offset + sizeOfCInt))
   cookie <- peek @Word32 (plusPtr inotify.buffer (offset + sizeOfCInt + 4))
   len <- peek @Word32 (plusPtr inotify.buffer (offset + sizeOfCInt + 8))
+  name <-
+    if len == 0
+      then pure ByteString.Short.empty
+      else do
+        let beginning = plusPtr inotify.buffer (offset + sizeOfCInt + 12)
+        end <- rawmemchr (ConstPtr beginning) 0
+        ByteString.Short.createFromPtr beginning (minusPtr end beginning)
   writeIORef inotify.offsetRef $! offset + sizeOfCInt + 12 + fromIntegral @Word32 @Int len
-  pure (InotifyEvent {wd, mask, cookie, len})
+  pure (Event {wd, mask, cookie, len, name})
 
 sizeOfCInt :: Int
 sizeOfCInt =
   sizeOf (0 :: CInt)
-
--- struct inotify_event {
---     int      wd;       /* Watch descriptor */
---     uint32_t mask;     /* Mask describing event */
---     uint32_t cookie;   /* Unique cookie associating related
---                           events (for rename(2)) */
---     uint32_t len;      /* Size of name field */
---     char     name[];   /* Optional null-terminated name */
--- };
-
-inotifyGetEvents :: Fd -> IO (Either Errno ShortByteString)
-inotifyGetEvents fd = do
-  allocaBytesAligned 4096 (sizeOf (0 :: Int)) \buf -> do
-    readloop fd buf 4096 >>= \case
-      Left errno -> pure (Left errno)
-      Right len -> Right <$> ByteString.Short.createFromPtr buf (fromIntegral @CSsize @Int len)
 
 readloop :: Fd -> Ptr a -> CSize -> IO (Either Errno CSsize)
 readloop fd buf size =
@@ -130,6 +122,9 @@ readloop fd buf size =
           readloop fd buf size
         else pure (Left errno)
     len -> pure (Right len)
+
+foreign import capi unsafe "string.h rawmemchr"
+  rawmemchr :: ConstPtr a -> CInt -> IO (Ptr b)
 
 foreign import capi unsafe "unistd.h read"
   read :: Fd -> Ptr a -> CSize -> IO CSsize
