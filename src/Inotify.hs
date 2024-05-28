@@ -1,6 +1,4 @@
 {-# LANGUAGE CApiFFI #-}
-{-# LANGUAGE MagicHash #-}
-{-# LANGUAGE UnliftedFFITypes #-}
 
 module Inotify
   ( Instance,
@@ -25,6 +23,11 @@ module Inotify
     pattern MovedTo,
     pattern Open,
 
+    -- ** Meta event types
+    pattern Ignored,
+    pattern QOverflow,
+    pattern Unmount,
+
     -- ** Derived event types
     allEvents,
     close,
@@ -39,10 +42,7 @@ module Inotify
     onlydir,
 
     -- * Event information
-    ignored,
     isdir,
-    qOverflow,
-    unmount,
 
     -- * Helpful debugging view of events
     showEvent,
@@ -99,6 +99,9 @@ showEvent event =
         MovedFrom -> ("MovedFrom " ++)
         MovedTo -> ("MovedTo " ++)
         Open -> ("Open " ++)
+        Ignored -> ("Ignored " ++)
+        QOverflow -> ("QOverflow " ++)
+        Unmount -> ("Unmount " ++)
         _ -> ("??? " ++)
         . case OsString.decodeWith IO.utf8 event.name of
           Left _ -> ("???" ++)
@@ -107,10 +110,7 @@ showEvent event =
           MovedFrom -> ((" cookie=" <> show event.cookie) ++)
           MovedTo -> ((" cookie=" <> show event.cookie) ++)
           _ -> id
-        . (if ignored event.mask then (" ignored" ++) else id)
         . (if isdir event.mask then (" isdir" ++) else id)
-        . (if qOverflow event.mask then (" qOverflow" ++) else id)
-        . (if unmount event.mask then (" unmount" ++) else id)
 
 data Instance
   = Instance
@@ -134,7 +134,7 @@ main = do
     forever @IO @() @() do
       result <- await inotify
       case result of
-        Left err -> do undefined
+        Left _err -> do undefined
         Right event -> putStrLn (showEvent event)
 
 -- | Perform an action with a new inotify instance.
@@ -327,31 +327,31 @@ pattern Open <- (has _IN_OPEN -> True)
     Open = Mask _IN_OPEN
 
 -- | A watch was removed explicitly or automatically.
-ignored :: Mask -> Bool
-ignored =
-  has _IN_IGNORED
+pattern Ignored :: Mask
+pattern Ignored <- (has _IN_IGNORED -> True)
+
+-- | The event queue overflowed.
+pattern QOverflow :: Mask
+pattern QOverflow <- (has _IN_Q_OVERFLOW -> True)
+
+-- | The filesystem contained the watched object was unmounted.
+pattern Unmount :: Mask
+pattern Unmount <- (has _IN_UNMOUNT -> True)
 
 -- | The subject of this event is a directory.
 isdir :: Mask -> Bool
 isdir =
   has _IN_ISDIR
 
--- | The event queue overflowed.
-qOverflow :: Mask -> Bool
-qOverflow =
-  has _IN_Q_OVERFLOW
-
--- | The filesystem contained the watched object was unmounted.
-unmount :: Mask -> Bool
-unmount =
-  has _IN_UNMOUNT
-
+-- | Equivalent to 'Access', 'Attrib', 'CloseNowrite', 'CloseWrite', 'Create', 'Delete', 'DeleteSelf', 'Modify', 'MoveSelf', 'MovedFrom', 'MovedTo', and 'Open' together.
 allEvents :: Mask
 allEvents = Mask _IN_ALL_EVENTS
 
+-- | Equivalent to 'CloseWrite' and 'CloseNowrite' together.
 close :: Mask
 close = Mask _IN_CLOSE
 
+-- | Equivalent to 'MovedFrom' and 'MovedTo' together.
 move :: Mask
 move = Mask _IN_MOVE
 
