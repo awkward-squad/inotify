@@ -87,25 +87,32 @@ showEvent event =
   where
     go =
       case event.mask of
-        Access -> ("Access " ++)
-        Attrib -> ("Attrib " ++)
-        CloseNowrite -> ("CloseNowrite " ++)
-        CloseWrite -> ("CloseWrite " ++)
-        Create -> ("Create " ++)
-        Delete -> ("Delete " ++)
-        DeleteSelf -> ("DeleteSelf " ++)
-        Modify -> ("Modify " ++)
-        MoveSelf -> ("MoveSelf " ++)
-        MovedFrom -> ("MovedFrom " ++)
-        MovedTo -> ("MovedTo " ++)
-        Open -> ("Open " ++)
-        Ignored -> ("Ignored " ++)
-        QOverflow -> ("QOverflow " ++)
-        Unmount -> ("Unmount " ++)
-        _ -> ("??? " ++)
-        . case OsString.decodeWith IO.utf8 event.name of
-          Left _ -> ("???" ++)
-          Right s -> (show s ++)
+        QOverflow -> id
+        _ -> (show event.wd ++) . (' ' :)
+        . case event.mask of
+          Access -> ("Access" ++)
+          Attrib -> ("Attrib" ++)
+          CloseNowrite -> ("CloseNowrite" ++)
+          CloseWrite -> ("CloseWrite" ++)
+          Create -> ("Create" ++)
+          Delete -> ("Delete" ++)
+          DeleteSelf -> ("DeleteSelf" ++)
+          Modify -> ("Modify" ++)
+          MoveSelf -> ("MoveSelf" ++)
+          MovedFrom -> ("MovedFrom" ++)
+          MovedTo -> ("MovedTo" ++)
+          Open -> ("Open" ++)
+          Ignored -> ("Ignored" ++)
+          QOverflow -> ("QOverflow" ++)
+          Unmount -> ("Unmount" ++)
+        . case event.mask of
+          Ignored -> id
+          QOverflow -> id
+          Unmount -> id
+          _ ->
+            (' ' :) . case OsString.decodeWith IO.utf8 event.name of
+              Left _ -> ("???" ++)
+              Right s -> (show s ++)
         . case event.mask of
           MovedFrom -> ((" cookie=" <> show event.cookie) ++)
           MovedTo -> ((" cookie=" <> show event.cookie) ++)
@@ -124,13 +131,36 @@ newtype Mask
   = Mask Word32
   deriving newtype (Show)
 
+{-# COMPLETE
+  Access,
+  Attrib,
+  CloseNowrite,
+  CloseWrite,
+  Create,
+  Delete,
+  DeleteSelf,
+  Modify,
+  MoveSelf,
+  MovedFrom,
+  MovedTo,
+  Open,
+  Ignored,
+  QOverflow,
+  Unmount
+  #-}
+
 newtype Option
   = Option Word32
 
 main :: IO (Either CInt ())
 main = do
   with \inotify -> do
-    watch inotify (OsString.unsafeEncodeUtf ".") [allEvents] [] >>= print
+    watch inotify (OsString.unsafeEncodeUtf ".") [allEvents] [] >>= \case
+      Left _err -> undefined
+      Right _wd -> pure ()
+    watch inotify (OsString.unsafeEncodeUtf "src") [allEvents] [] >>= \case
+      Left _err -> undefined
+      Right _wd -> pure ()
     forever @IO @() @() do
       result <- await inotify
       case result of
@@ -326,7 +356,7 @@ pattern Open <- (has _IN_OPEN -> True)
   where
     Open = Mask _IN_OPEN
 
--- | A watch was removed explicitly or automatically.
+-- | A watch was removed.
 pattern Ignored :: Mask
 pattern Ignored <- (has _IN_IGNORED -> True)
 
@@ -334,7 +364,7 @@ pattern Ignored <- (has _IN_IGNORED -> True)
 pattern QOverflow :: Mask
 pattern QOverflow <- (has _IN_Q_OVERFLOW -> True)
 
--- | The filesystem contained the watched object was unmounted.
+-- | The filesystem containing a watched object was unmounted.
 pattern Unmount :: Mask
 pattern Unmount <- (has _IN_UNMOUNT -> True)
 
