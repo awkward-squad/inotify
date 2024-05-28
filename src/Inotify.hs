@@ -51,24 +51,21 @@ where
 
 import Control.Concurrent (threadWaitRead)
 import Control.Exception qualified as Exception
-import Control.Monad (forever, guard)
+import Control.Monad (forever)
 import Data.Bits ((.&.), (.|.))
-import Data.ByteString.Short (ShortByteString)
 import Data.ByteString.Short qualified as ByteString.Short
 import Data.ByteString.Short.Internal qualified as ByteString.Short (createFromPtr)
 import Data.Coerce (coerce)
 import Data.Either
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List qualified as List
-import Data.Maybe (catMaybes, mapMaybe)
 import Data.Word (Word32)
 import Foreign (Ptr, Storable (peek, sizeOf), allocaBytesAligned, minusPtr, plusPtr)
 import Foreign.C (CInt (..), CSize (..), Errno (..), eAGAIN, getErrno)
 import Foreign.C.ConstPtr (ConstPtr (ConstPtr))
 import Posix.Inotify.Bindings
 import System.IO qualified as IO
-import System.OsString (OsString)
-import System.OsString.Internal.Types (OsString (..), PosixString (..))
+import System.OsString.Internal.Types (PosixString (..))
 import System.OsString.Posix qualified as OsString
 import System.Posix.Types (CSsize (..), Fd (..))
 import Prelude hiding (read)
@@ -126,18 +123,9 @@ data Instance
 newtype Mask
   = Mask Word32
   deriving newtype (Show)
-  deriving (Semigroup) via (Or)
 
 newtype Option
   = Option Word32
-  deriving (Semigroup) via (Or)
-
-newtype Or
-  = Or Word32
-
-instance Semigroup Or where
-  Or x <> Or y =
-    Or (x .|. y)
 
 main :: IO (Either CInt ())
 main = do
