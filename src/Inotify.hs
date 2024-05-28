@@ -43,30 +43,77 @@ module Inotify
     isdir,
     qOverflow,
     unmount,
+
+    -- * Helpful debugging view of events
+    showEvent,
   )
 where
 
 import Control.Concurrent (threadWaitRead)
 import Control.Exception qualified as Exception
-import Control.Monad (forever)
+import Control.Monad (forever, guard)
 import Data.Bits ((.&.), (.|.))
 import Data.ByteString.Short (ShortByteString)
 import Data.ByteString.Short qualified as ByteString.Short
 import Data.ByteString.Short.Internal qualified as ByteString.Short (createFromPtr)
 import Data.Coerce (coerce)
+import Data.Either
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List qualified as List
+import Data.Maybe (catMaybes, mapMaybe)
 import Data.Word (Word32)
 import Foreign (Ptr, Storable (peek, sizeOf), allocaBytesAligned, minusPtr, plusPtr)
 import Foreign.C (CInt (..), CSize (..), Errno (..), eAGAIN, getErrno)
 import Foreign.C.ConstPtr (ConstPtr (ConstPtr))
 import Posix.Inotify.Bindings
-import System.OsString (OsString, unsafeEncodeUtf)
+import System.IO qualified as IO
+import System.OsString (OsString)
 import System.OsString.Internal.Types (OsString (..), PosixString (..))
+import System.OsString.Posix qualified as OsString
 import System.Posix.Types (CSsize (..), Fd (..))
 import Prelude hiding (read)
 
 type WatchDescriptor = CInt
+
+data Event
+  = Event
+  { wd :: {-# UNPACK #-} !CInt,
+    mask :: {-# UNPACK #-} !Mask,
+    cookie :: {-# UNPACK #-} !Word32,
+    name :: !PosixString
+  }
+  deriving stock (Show)
+
+showEvent :: Event -> [Char]
+showEvent event =
+  go ""
+  where
+    go =
+      case event.mask of
+        Access -> ("Access " ++)
+        Attrib -> ("Attrib " ++)
+        CloseNowrite -> ("CloseNowrite " ++)
+        CloseWrite -> ("CloseWrite " ++)
+        Create -> ("Create " ++)
+        Delete -> ("Delete " ++)
+        DeleteSelf -> ("DeleteSelf " ++)
+        Modify -> ("Modify " ++)
+        MoveSelf -> ("MoveSelf " ++)
+        MovedFrom -> ("MovedFrom " ++)
+        MovedTo -> ("MovedTo " ++)
+        Open -> ("Open " ++)
+        _ -> ("??? " ++)
+        . case OsString.decodeWith IO.utf8 event.name of
+          Left _ -> ("???" ++)
+          Right s -> (show s ++)
+        . case event.mask of
+          MovedFrom -> ((" cookie=" <> show event.cookie) ++)
+          MovedTo -> ((" cookie=" <> show event.cookie) ++)
+          _ -> id
+        . (if ignored event.mask then (" ignored" ++) else id)
+        . (if isdir event.mask then (" isdir" ++) else id)
+        . (if qOverflow event.mask then (" qOverflow" ++) else id)
+        . (if unmount event.mask then (" unmount" ++) else id)
 
 data Instance
   = Instance
@@ -95,9 +142,12 @@ instance Semigroup Or where
 main :: IO (Either CInt ())
 main = do
   with \inotify -> do
-    watch inotify (unsafeEncodeUtf ".") [allEvents] [] >>= print
+    watch inotify (OsString.unsafeEncodeUtf ".") [allEvents] [] >>= print
     forever @IO @() @() do
-      await inotify >>= print
+      result <- await inotify
+      case result of
+        Left err -> do undefined
+        Right event -> putStrLn (showEvent event)
 
 -- | Perform an action with a new inotify instance.
 with :: (Instance -> IO a) -> IO (Either CInt a)
@@ -118,8 +168,8 @@ with action =
               Right <$> action Instance {fd, buffer, offsetRef, buflenRef}
 
 -- | Add a new watch, or modify an existing watch.
-watch :: Instance -> OsString -> [Mask] -> [Option] -> IO (Either CInt WatchDescriptor)
-watch inst (OsString (PosixString path)) mask opts =
+watch :: Instance -> PosixString -> [Mask] -> [Option] -> IO (Either CInt WatchDescriptor)
+watch inst (PosixString path) mask opts =
   ByteString.Short.useAsCString path \cpath ->
     inotify_add_watch inst.fd (ConstPtr cpath) (combine mask opts) >>= \case
       -1 -> do
@@ -197,7 +247,7 @@ parseEvent inotify offset = do
       { wd,
         mask = Mask mask,
         cookie,
-        name
+        name = PosixString name
       }
 
 has :: Word32 -> Mask -> Bool
@@ -215,15 +265,6 @@ readloop fd buf size =
           readloop fd buf size
         else pure (Left errno)
     len -> pure (Right len)
-
-data Event
-  = Event
-  { wd :: {-# UNPACK #-} !CInt,
-    mask :: {-# UNPACK #-} !Mask,
-    cookie :: {-# UNPACK #-} !Word32,
-    name :: !ShortByteString
-  }
-  deriving stock (Show)
 
 -- | A file was accessed.
 pattern Access :: Mask
