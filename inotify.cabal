@@ -14,10 +14,16 @@ library
   default-extensions:
     BlockArguments
     DerivingStrategies
+    DerivingVia
     LambdaCase
     MultiWayIf
     NoFieldSelectors
     OverloadedRecordDot
+    PatternSynonyms
+    ViewPatterns
   default-language: GHC2021
   exposed-modules: Inotify
   ghc-options: -Wall
+  hs-source-dirs: src
+  other-modules:
+    Posix.Inotify.Bindings
