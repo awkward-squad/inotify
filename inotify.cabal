@@ -13,13 +13,14 @@ library
     unix,
   default-extensions:
     BlockArguments
+    DataKinds
     DerivingStrategies
     DerivingVia
     LambdaCase
-    MultiWayIf
     NoFieldSelectors
     OverloadedRecordDot
     PatternSynonyms
+    TypeFamilies
     ViewPatterns
   default-language: GHC2021
   exposed-modules: Inotify

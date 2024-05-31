@@ -6,6 +6,7 @@ module Inotify
     Mask,
     Option,
     WatchDescriptor,
+    Error (..),
     with,
     watch,
     unwatch,
@@ -59,12 +60,32 @@ import Data.ByteString.Short qualified as ByteString.Short
 import Data.ByteString.Short.Internal qualified as ByteString.Short (createFromPtr)
 import Data.Coerce (coerce)
 import Data.Either
+import Data.Functor (void)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List qualified as List
 import Data.Word (Word32)
 import Foreign (Ptr, Storable (peek, sizeOf), allocaBytesAligned, minusPtr, plusPtr)
-import Foreign.C (CInt (..), CSize (..), Errno (..), eAGAIN, getErrno)
+import Foreign.C
+  ( CInt (..),
+    CSize (..),
+    Errno (..),
+    eACCES,
+    eAGAIN,
+    eEXIST,
+    eFAULT,
+    eINVAL,
+    eMFILE,
+    eNAMETOOLONG,
+    eNFILE,
+    eNOENT,
+    eNOMEM,
+    eNOSPC,
+    eNOTDIR,
+    eWOULDBLOCK,
+    getErrno,
+  )
 import Foreign.C.ConstPtr (ConstPtr (ConstPtr))
+import GHC.TypeLits (Symbol)
 import Posix.Inotify.Bindings
 import System.IO qualified as IO
 import System.OsString.Internal.Types (PosixString (..))
@@ -156,15 +177,20 @@ newtype Option
   = Option Word32
 
 -- | Perform an action with a new inotify instance.
-with :: (Inotify -> IO a) -> IO (Either CInt a)
+with :: (Inotify -> IO a) -> IO (Either (Error "inotify_init1") a)
 with action =
   Exception.mask \unmask -> do
     -- Initialize an inotify instance with IN_CLOEXEC (to prevent leaking file descriptors on fork, even though no one
     -- really forks in Haskell) and IN_NONBLOCK (because we want to perform nonblocking reads).
     inotify_init1 (_IN_CLOEXEC .|. _IN_NONBLOCK) >>= \case
       -1 -> do
-        Errno errno <- getErrno
-        pure (Left errno)
+        errno@(Errno n) <- getErrno
+        pure $
+          Left case () of
+            _ | errno == eMFILE -> EMFILE
+            _ | errno == eNFILE -> ENFILE
+            _ | errno == eNOMEM -> ENOMEM
+            _ | otherwise -> error ("inotify_init1: unexpected errno " ++ show n)
       fd -> do
         (`Exception.finally` c_close fd) do
           unmask do
@@ -174,13 +200,25 @@ with action =
               Right <$> action Inotify {fd, buffer, offsetRef, buflenRef}
 
 -- | Add a new watch, or modify an existing watch.
-watch :: Inotify -> PosixString -> [Mask] -> [Option] -> IO (Either CInt WatchDescriptor)
+watch :: Inotify -> PosixString -> [Mask] -> [Option] -> IO (Either (Error "inotify_add_watch") WatchDescriptor)
 watch inotify (PosixString path) mask opts =
   ByteString.Short.useAsCString path \cpath ->
     inotify_add_watch inotify.fd (ConstPtr cpath) (combine mask opts) >>= \case
       -1 -> do
-        Errno errno <- getErrno
-        pure (Left errno)
+        errno@(Errno n) <- getErrno
+        pure $
+          -- omit EBADF because we expect our inotify fd
+          Left case () of
+            _ | errno == eACCES -> EACCES
+            _ | errno == eEXIST -> EEXIST
+            _ | errno == eFAULT -> EFAULT
+            _ | errno == eINVAL -> EINVAL
+            _ | errno == eNAMETOOLONG -> ENAMETOOLONG
+            _ | errno == eNOENT -> ENOENT
+            _ | errno == eNOMEM -> ENOMEM
+            _ | errno == eNOSPC -> ENOSPC
+            _ | errno == eNOTDIR -> ENOTDIR
+            _ | otherwise -> error ("inotify_add_watch: unexpected errno " ++ show n)
       wd -> pure (Right (fromIntegral @CInt @Int wd))
 
 combine :: [Mask] -> [Option] -> Word32
@@ -191,31 +229,42 @@ combine masks options =
     (coerce @[Option] @[Word32] options)
 
 -- | Remove a watch.
-unwatch :: Inotify -> WatchDescriptor -> IO (Either CInt ())
+unwatch :: Inotify -> WatchDescriptor -> IO ()
 unwatch inotify wd =
-  inotify_rm_watch inotify.fd (fromIntegral @Int @CInt wd) >>= \case
-    0 -> pure (Right ())
-    _ -> do
-      Errno errno <- getErrno
-      pure (Left errno)
+  -- ignore errors here because they aren't interesting -
+  --   EBADF, we expect our inotify fd so we won't get this
+  --   EINVAL, ditto, and maybe this wd was already unwatched; returning unit seems fine
+  void (inotify_rm_watch inotify.fd (fromIntegral @Int @CInt wd))
 
 -- | Await an event.
-await :: Inotify -> IO (Either CInt Event)
+await :: Inotify -> IO Event
 await inotify = do
   offset <- readIORef inotify.offsetRef
   buflen <- readIORef inotify.buflenRef
-  if offset >= buflen
-    then do
-      readloop inotify.fd inotify.buffer 4096 >>= \case
-        Left errno -> pure (Left errno)
-        Right len -> do
-          writeIORef inotify.offsetRef 0
-          writeIORef inotify.buflenRef (fromIntegral @CSsize @Int len)
-          Right <$> parseEvent inotify 0
-    else Right <$> parseEvent inotify offset
+  offset1 <-
+    if offset >= buflen
+      then do
+        len <- readloop inotify.fd inotify.buffer 4096
+        writeIORef inotify.offsetRef 0
+        writeIORef inotify.buflenRef (fromIntegral @CSsize @Int len)
+        pure 0
+      else pure offset
+  parseEvent inotify offset1
+
+readloop :: CInt -> Ptr a -> CSize -> IO CSsize
+readloop fd buf size =
+  c_read fd buf size >>= \case
+    -1 -> do
+      errno@(Errno n) <- getErrno
+      if errno == eAGAIN || errno == eWOULDBLOCK
+        then do
+          threadWaitRead (Fd fd)
+          readloop fd buf size
+        else error ("read: unexpected errno " ++ show n)
+    len -> pure len
 
 -- | Poll for an event.
-poll :: Inotify -> IO (Either CInt (Maybe Event))
+poll :: Inotify -> IO (Maybe Event)
 poll inotify = do
   offset <- readIORef inotify.offsetRef
   buflen <- readIORef inotify.buflenRef
@@ -223,16 +272,15 @@ poll inotify = do
     then do
       c_read inotify.fd inotify.buffer 4096 >>= \case
         -1 -> do
-          Errno errno <- getErrno
-          pure
-            if Errno errno == eAGAIN
-              then Right Nothing
-              else Left errno
+          errno@(Errno n) <- getErrno
+          if errno == eAGAIN || errno == eWOULDBLOCK
+            then pure Nothing
+            else error ("read: unexpected errno " ++ show n)
         len -> do
           writeIORef inotify.offsetRef 0
           writeIORef inotify.buflenRef (fromIntegral @CSsize @Int len)
-          Right . Just <$> parseEvent inotify 0
-    else Right . Just <$> parseEvent inotify offset
+          Just <$> parseEvent inotify 0
+    else Just <$> parseEvent inotify offset
 
 parseEvent :: Inotify -> Int -> IO Event
 parseEvent inotify offset = do
@@ -259,18 +307,6 @@ parseEvent inotify offset = do
 has :: Word32 -> Mask -> Bool
 has bit (Mask set) =
   set .&. bit /= 0
-
-readloop :: CInt -> Ptr a -> CSize -> IO (Either CInt CSsize)
-readloop fd buf size =
-  c_read fd buf size >>= \case
-    -1 -> do
-      Errno errno <- getErrno
-      if Errno errno == eAGAIN
-        then do
-          threadWaitRead (Fd fd)
-          readloop fd buf size
-        else pure (Left errno)
-    len -> pure (Right len)
 
 -- | A file was accessed.
 pattern Access :: Mask
@@ -400,6 +436,84 @@ onlydir = Option _IN_ONLYDIR
 sizeOfCInt :: Int
 sizeOfCInt =
   sizeOf (0 :: CInt)
+
+------------------------------------------------------------------------------------------------------------------------
+-- Errors
+
+type family CanReturnEACCES (s :: Symbol) :: Bool where
+  CanReturnEACCES "inotify_add_watch" = 'True
+  CanReturnEACCES _ = 'False
+
+type family CanReturnEEXIST (s :: Symbol) :: Bool where
+  CanReturnEEXIST "inotify_add_watch" = 'True
+  CanReturnEEXIST _ = 'False
+
+type family CanReturnEFAULT (s :: Symbol) :: Bool where
+  CanReturnEFAULT "inotify_add_watch" = 'True
+  CanReturnEFAULT _ = 'False
+
+type family CanReturnEINVAL (s :: Symbol) :: Bool where
+  CanReturnEINVAL "inotify_add_watch" = 'True
+  CanReturnEINVAL _ = 'False
+
+type family CanReturnEMFILE (s :: Symbol) :: Bool where
+  CanReturnEMFILE "inotify_init1" = 'True
+  CanReturnEMFILE _ = 'False
+
+type family CanReturnENAMETOOLONG (s :: Symbol) :: Bool where
+  CanReturnENAMETOOLONG "inotify_add_watch" = 'True
+  CanReturnENAMETOOLONG _ = 'False
+
+type family CanReturnENFILE (s :: Symbol) :: Bool where
+  CanReturnENFILE "inotify_init1" = 'True
+  CanReturnENFILE _ = 'False
+
+type family CanReturnENOENT (s :: Symbol) :: Bool where
+  CanReturnENOENT "inotify_add_watch" = 'True
+  CanReturnENOENT _ = 'False
+
+type family CanReturnENOMEM (s :: Symbol) :: Bool where
+  CanReturnENOMEM "inotify_add_watch" = 'True
+  CanReturnENOMEM "inotify_init1" = 'True
+  CanReturnENOMEM _ = 'False
+
+type family CanReturnENOSPC (s :: Symbol) :: Bool where
+  CanReturnENOSPC "inotify_add_watch" = 'True
+  CanReturnENOSPC _ = 'False
+
+type family CanReturnENOTDIR (s :: Symbol) :: Bool where
+  CanReturnENOTDIR "inotify_add_watch" = 'True
+  CanReturnENOTDIR _ = 'False
+
+data Error (s :: Symbol) where
+  EACCES :: (CanReturnEACCES s ~ 'True) => Error s
+  EEXIST :: (CanReturnEEXIST s ~ 'True) => Error s
+  EFAULT :: (CanReturnEFAULT s ~ 'True) => Error s
+  EINVAL :: (CanReturnEINVAL s ~ 'True) => Error s
+  EMFILE :: (CanReturnEMFILE s ~ 'True) => Error s
+  ENAMETOOLONG :: (CanReturnENAMETOOLONG s ~ 'True) => Error s
+  ENFILE :: (CanReturnENFILE s ~ 'True) => Error s
+  ENOENT :: (CanReturnENOENT s ~ 'True) => Error s
+  ENOMEM :: (CanReturnENOMEM s ~ 'True) => Error s
+  ENOSPC :: (CanReturnENOSPC s ~ 'True) => Error s
+  ENOTDIR :: (CanReturnENOTDIR s ~ 'True) => Error s
+
+instance Show (Error s) where
+  show = \case
+    EACCES -> "EACCES"
+    EEXIST -> "EEXIST"
+    EFAULT -> "EFAULT"
+    EINVAL -> "EINVAL"
+    EMFILE -> "EMFILE"
+    ENAMETOOLONG -> "ENAMETOOLONG"
+    ENFILE -> "ENFILE"
+    ENOENT -> "ENOENT"
+    ENOMEM -> "ENOMEM"
+    ENOSPC -> "ENOSPC"
+    ENOTDIR -> "ENOTDIR"
+
+------------------------------------------------------------------------------------------------------------------------
+-- Foreign calls
 
 foreign import capi unsafe "unistd.h close"
   c_close :: CInt -> IO CInt
