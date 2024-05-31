@@ -3,6 +3,9 @@
 module Inotify
   ( Instance,
     Event (..),
+    Mask,
+    Option,
+    WatchDescriptor,
     with,
     watch,
     unwatch,
@@ -51,7 +54,6 @@ where
 
 import Control.Concurrent (threadWaitRead)
 import Control.Exception qualified as Exception
-import Control.Monad (forever)
 import Data.Bits ((.&.), (.|.))
 import Data.ByteString.Short qualified as ByteString.Short
 import Data.ByteString.Short.Internal qualified as ByteString.Short (createFromPtr)
@@ -151,21 +153,6 @@ newtype Mask
 
 newtype Option
   = Option Word32
-
-main :: IO (Either CInt ())
-main = do
-  with \inotify -> do
-    watch inotify (OsString.unsafeEncodeUtf ".") [allEvents] [] >>= \case
-      Left _err -> undefined
-      Right _wd -> pure ()
-    watch inotify (OsString.unsafeEncodeUtf "src") [allEvents] [] >>= \case
-      Left _err -> undefined
-      Right _wd -> pure ()
-    forever @IO @() @() do
-      result <- await inotify
-      case result of
-        Left _err -> do undefined
-        Right event -> putStrLn (showEvent event)
 
 -- | Perform an action with a new inotify instance.
 with :: (Instance -> IO a) -> IO (Either CInt a)
