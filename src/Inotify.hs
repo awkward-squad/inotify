@@ -1,7 +1,7 @@
 {-# LANGUAGE CApiFFI #-}
 
 module Inotify
-  ( Instance,
+  ( Inotify,
     Event (..),
     Mask,
     Option,
@@ -72,11 +72,9 @@ import System.OsString.Posix qualified as OsString
 import System.Posix.Types (CSsize (..), Fd (..))
 import Prelude hiding (read)
 
-type WatchDescriptor = CInt
-
 data Event
   = Event
-  { wd :: {-# UNPACK #-} !CInt,
+  { wd :: {-# UNPACK #-} !WatchDescriptor,
     mask :: {-# UNPACK #-} !Mask,
     cookie :: {-# UNPACK #-} !Word32,
     name :: !PosixString
@@ -121,8 +119,11 @@ showEvent event =
           _ -> id
         . (if isdir event.mask then (" isdir" ++) else id)
 
-data Instance
-  = Instance
+type WatchDescriptor =
+  Int
+
+data Inotify
+  = Inotify
   { fd :: {-# UNPACK #-} !CInt,
     buffer :: {-# UNPACK #-} !(Ptr ()),
     offsetRef :: {-# UNPACK #-} !(IORef Int),
@@ -155,7 +156,7 @@ newtype Option
   = Option Word32
 
 -- | Perform an action with a new inotify instance.
-with :: (Instance -> IO a) -> IO (Either CInt a)
+with :: (Inotify -> IO a) -> IO (Either CInt a)
 with action =
   Exception.mask \unmask -> do
     -- Initialize an inotify instance with IN_CLOEXEC (to prevent leaking file descriptors on fork, even though no one
@@ -170,17 +171,17 @@ with action =
             offsetRef <- newIORef 0
             buflenRef <- newIORef 0
             allocaBytesAligned 4096 (sizeOf (0 :: Int)) \buffer ->
-              Right <$> action Instance {fd, buffer, offsetRef, buflenRef}
+              Right <$> action Inotify {fd, buffer, offsetRef, buflenRef}
 
 -- | Add a new watch, or modify an existing watch.
-watch :: Instance -> PosixString -> [Mask] -> [Option] -> IO (Either CInt WatchDescriptor)
-watch inst (PosixString path) mask opts =
+watch :: Inotify -> PosixString -> [Mask] -> [Option] -> IO (Either CInt WatchDescriptor)
+watch inotify (PosixString path) mask opts =
   ByteString.Short.useAsCString path \cpath ->
-    inotify_add_watch inst.fd (ConstPtr cpath) (combine mask opts) >>= \case
+    inotify_add_watch inotify.fd (ConstPtr cpath) (combine mask opts) >>= \case
       -1 -> do
         Errno errno <- getErrno
         pure (Left errno)
-      wd -> pure (Right wd)
+      wd -> pure (Right (fromIntegral @CInt @Int wd))
 
 combine :: [Mask] -> [Option] -> Word32
 combine masks options =
@@ -190,16 +191,16 @@ combine masks options =
     (coerce @[Option] @[Word32] options)
 
 -- | Remove a watch.
-unwatch :: Instance -> WatchDescriptor -> IO (Either CInt ())
-unwatch inst wd =
-  inotify_rm_watch inst.fd wd >>= \case
+unwatch :: Inotify -> WatchDescriptor -> IO (Either CInt ())
+unwatch inotify wd =
+  inotify_rm_watch inotify.fd (fromIntegral @Int @CInt wd) >>= \case
     0 -> pure (Right ())
     _ -> do
       Errno errno <- getErrno
       pure (Left errno)
 
 -- | Await an event.
-await :: Instance -> IO (Either CInt Event)
+await :: Inotify -> IO (Either CInt Event)
 await inotify = do
   offset <- readIORef inotify.offsetRef
   buflen <- readIORef inotify.buflenRef
@@ -214,13 +215,13 @@ await inotify = do
     else Right <$> parseEvent inotify offset
 
 -- | Poll for an event.
-poll :: Instance -> IO (Either CInt (Maybe Event))
-poll inst = do
-  offset <- readIORef inst.offsetRef
-  buflen <- readIORef inst.buflenRef
+poll :: Inotify -> IO (Either CInt (Maybe Event))
+poll inotify = do
+  offset <- readIORef inotify.offsetRef
+  buflen <- readIORef inotify.buflenRef
   if offset >= buflen
     then do
-      c_read inst.fd inst.buffer 4096 >>= \case
+      c_read inotify.fd inotify.buffer 4096 >>= \case
         -1 -> do
           Errno errno <- getErrno
           pure
@@ -228,12 +229,12 @@ poll inst = do
               then Right Nothing
               else Left errno
         len -> do
-          writeIORef inst.offsetRef 0
-          writeIORef inst.buflenRef (fromIntegral @CSsize @Int len)
-          Right . Just <$> parseEvent inst 0
-    else Right . Just <$> parseEvent inst offset
+          writeIORef inotify.offsetRef 0
+          writeIORef inotify.buflenRef (fromIntegral @CSsize @Int len)
+          Right . Just <$> parseEvent inotify 0
+    else Right . Just <$> parseEvent inotify offset
 
-parseEvent :: Instance -> Int -> IO Event
+parseEvent :: Inotify -> Int -> IO Event
 parseEvent inotify offset = do
   wd <- peek @CInt (plusPtr inotify.buffer offset)
   mask <- peek @Word32 (plusPtr inotify.buffer (offset + sizeOfCInt))
@@ -249,7 +250,7 @@ parseEvent inotify offset = do
   writeIORef inotify.offsetRef $! offset + sizeOfCInt + 12 + fromIntegral @Word32 @Int len
   pure
     Event
-      { wd,
+      { wd = fromIntegral @CInt @Int wd,
         mask = Mask mask,
         cookie,
         name = PosixString name
